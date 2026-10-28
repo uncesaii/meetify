@@ -1,4 +1,4 @@
-use crate::database::models::{Setting, TranscriptSetting};
+﻿use crate::database::models::{Setting, TranscriptSetting};
 use crate::summary::CustomOpenAIConfig;
 use sqlx::SqlitePool;
 
@@ -85,6 +85,7 @@ impl SettingsRepository {
             "ollama" => "ollamaApiKey",
             "groq" => "groqApiKey",
             "openrouter" => "openRouterApiKey",
+            "gemini" => "geminiApiKey",
             "builtin-ai" => return Ok(()), // No API key needed
             _ => {
                 return Err(sqlx::Error::Protocol(
@@ -123,6 +124,7 @@ impl SettingsRepository {
             "groq" => "groqApiKey",
             "claude" => "anthropicApiKey",
             "openrouter" => "openRouterApiKey",
+            "gemini" => "geminiApiKey",
             "builtin-ai" => return Ok(None), // No API key needed
             _ => {
                 return Err(sqlx::Error::Protocol(
@@ -249,6 +251,7 @@ impl SettingsRepository {
             "groq" => "groqApiKey",
             "claude" => "anthropicApiKey",
             "openrouter" => "openRouterApiKey",
+            "gemini" => "geminiApiKey",
             "builtin-ai" => return Ok(()), // No API key needed
             _ => {
                 return Err(sqlx::Error::Protocol(
@@ -346,3 +349,4 @@ impl SettingsRepository {
         Ok(())
     }
 }
+

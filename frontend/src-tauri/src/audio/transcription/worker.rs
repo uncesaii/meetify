@@ -55,7 +55,7 @@ pub fn start_transcription_task<R: Runtime>(
     tokio::spawn(async move {
         info!("🚀 Starting optimized parallel transcription task - guaranteeing zero chunk loss");
 
-        // Initialize transcription engine (Whisper or Parakeet based on config)
+        // Initialize transcription engine (Groq API)
         let transcription_engine = match super::engine::get_or_init_transcription_engine(&app).await {
             Ok(engine) => engine,
             Err(e) => {
@@ -79,22 +79,20 @@ pub fn start_transcription_task<R: Runtime>(
         let chunks_queued = Arc::new(AtomicU64::new(0));
         let chunks_completed = Arc::new(AtomicU64::new(0));
         let input_finished = Arc::new(AtomicBool::new(false));
+        let last_transcript_context = Arc::new(tokio::sync::Mutex::new(String::new()));
 
         info!("📊 Starting {} transcription worker{} (serial mode for ordered emission)", NUM_WORKERS, if NUM_WORKERS == 1 { "" } else { "s" });
 
         // Spawn worker tasks
         let mut worker_handles = Vec::new();
         for worker_id in 0..NUM_WORKERS {
-            let engine_clone = match &transcription_engine {
-                TranscriptionEngine::Whisper(e) => TranscriptionEngine::Whisper(e.clone()),
-                TranscriptionEngine::Parakeet(e) => TranscriptionEngine::Parakeet(e.clone()),
-                TranscriptionEngine::Provider(p) => TranscriptionEngine::Provider(p.clone()),
-            };
+            let engine_clone = transcription_engine.clone();
             let app_clone = app.clone();
             let work_receiver_clone = work_receiver.clone();
             let chunks_completed_clone = chunks_completed.clone();
             let input_finished_clone = input_finished.clone();
             let chunks_queued_clone = chunks_queued.clone();
+            let last_transcript_clone = last_transcript_context.clone();
 
             let worker_handle = tokio::spawn(async move {
                 info!("👷 Worker {} started", worker_id);
@@ -103,7 +101,6 @@ pub fn start_transcription_task<R: Runtime>(
                 let initial_model_loaded = engine_clone.is_model_loaded().await;
                 let current_model = engine_clone
                     .get_current_model()
-                    .await
                     .unwrap_or_else(|| "unknown".to_string());
 
                 let engine_name = engine_clone.provider_name();
@@ -150,11 +147,21 @@ pub fn start_transcription_task<R: Runtime>(
                             let chunk_timestamp = chunk.timestamp;
                             let chunk_duration = chunk.data.len() as f64 / chunk.sample_rate as f64;
 
-                            // Transcribe with provider-agnostic approach
+                            let prompt_ctx = {
+                                let last = last_transcript_clone.lock().await;
+                                if last.trim().is_empty() {
+                                    None
+                                } else {
+                                    Some(last.clone())
+                                }
+                            };
+
+                            // Transcribe with provider-agnostic approach and context priming
                             match transcribe_chunk_with_provider(
                                 &engine_clone,
                                 chunk,
                                 &app_clone,
+                                prompt_ctx,
                             )
                             .await
                             {
@@ -168,6 +175,17 @@ pub fn start_transcription_task<R: Runtime>(
                 worker_id, transcript, confidence_str, is_partial);
 
                                     if should_emit_transcript(&transcript) {
+                                        // Update context prompt for seamless cross-chunk coherence
+                                        {
+                                            let mut last = last_transcript_clone.lock().await;
+                                            let t = transcript.trim();
+                                            if t.len() > 150 {
+                                                *last = t[t.len() - 150..].to_string();
+                                            } else {
+                                                *last = t.to_string();
+                                            }
+                                        }
+
                                         // PERFORMANCE: Only log transcription results, not every processing step
                                         info!("✅ Worker {} transcribed: {} (confidence: {}, partial: {})",
                                               worker_id, transcript, confidence_str, is_partial);
@@ -401,6 +419,7 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
     engine: &TranscriptionEngine,
     chunk: AudioChunk,
     app: &AppHandle<R>,
+    prompt: Option<String>,
 ) -> std::result::Result<(String, Option<f32>, bool), TranscriptionError> {
     // Convert to 16kHz mono for transcription
     let transcription_data = if chunk.sample_rate != 16000 {
@@ -434,52 +453,23 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
         energy
     );
 
-    // Transcribe using the appropriate engine (with improved error handling)
+    // Skip audio chunks that are too short to contain a word (< 200ms = 3200 samples at 16kHz)
+    if speech_samples.len() < 3200 {
+        return Ok((String::new(), None, false));
+    }
+
+    // Filter near-silent background noise (< 0.00003) to prevent Whisper hallucinations
+    if energy < 0.00003 {
+        return Ok((String::new(), None, false));
+    }
+
+    // Get language preference
+    let language = crate::get_language_preference_internal();
+
+    // Transcribe using the appropriate engine (with improved error handling and language hints)
     match engine {
-        TranscriptionEngine::Whisper(whisper_engine) => {
-            // Get language preference from global state
-            let language = crate::get_language_preference_internal();
-
-            match whisper_engine
-                .transcribe_audio_with_confidence(speech_samples, language)
-                .await
-            {
-                Ok((text, confidence, is_partial)) => {
-                    let cleaned_text = text.trim().to_string();
-                    if cleaned_text.is_empty() {
-                        return Ok((String::new(), Some(confidence), is_partial));
-                    }
-
-                    info!(
-                        "Whisper transcription complete for chunk {}: '{}' (confidence: {:.2}, partial: {})",
-                        chunk.chunk_id, cleaned_text, confidence, is_partial
-                    );
-
-                    Ok((cleaned_text, Some(confidence), is_partial))
-                }
-                Err(e) => {
-                    error!(
-                        "Whisper transcription failed for chunk {}: {}",
-                        chunk.chunk_id, e
-                    );
-
-                    let transcription_error = TranscriptionError::EngineFailed(e.to_string());
-                    let _ = app.emit(
-                        "transcription-error",
-                        &serde_json::json!({
-                            "error": transcription_error.to_string(),
-                            "userMessage": format!("Transcription failed: {}", transcription_error),
-                            "actionable": false,
-                            "phase": "active"
-                        }),
-                    );
-
-                    Err(transcription_error)
-                }
-            }
-        }
-        TranscriptionEngine::Parakeet(parakeet_engine) => {
-            match parakeet_engine.transcribe_audio(speech_samples).await {
+        TranscriptionEngine::GroqApi { .. } => {
+            match engine.transcribe_with_options(&speech_samples, 16000, language, prompt).await {
                 Ok(text) => {
                     let cleaned_text = text.trim().to_string();
                     if cleaned_text.is_empty() {
@@ -487,20 +477,19 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
                     }
 
                     info!(
-                        "Parakeet transcription complete for chunk {}: '{}'",
+                        "Groq transcription complete for chunk {}: '{}'",
                         chunk.chunk_id, cleaned_text
                     );
 
-                    // Parakeet doesn't provide confidence or partial results
                     Ok((cleaned_text, None, false))
                 }
                 Err(e) => {
                     error!(
-                        "Parakeet transcription failed for chunk {}: {}",
+                        "Groq transcription failed for chunk {}: {}",
                         chunk.chunk_id, e
                     );
 
-                    let transcription_error = TranscriptionError::EngineFailed(e.to_string());
+                    let transcription_error = TranscriptionError::EngineFailed(e);
                     let _ = app.emit(
                         "transcription-error",
                         &serde_json::json!({

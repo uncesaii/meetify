@@ -1,4 +1,4 @@
-﻿use tauri::{
+use tauri::{
     Emitter,
     menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem},
     tray::TrayIconBuilder,
@@ -280,14 +280,7 @@ async fn check_can_record<R: Runtime>(app: &AppHandle<R>) -> bool {
         return true;
     }
 
-    // During onboarding, check if Parakeet transcription model is ready
-    match crate::parakeet_engine::commands::parakeet_has_available_models().await {
-        Ok(has_models) => has_models,
-        Err(e) => {
-            log::warn!("Tray: Failed to check Parakeet models: {}, assuming not ready", e);
-            false
-        }
-    }
+    true
 }
 
 pub async fn update_tray_menu_async<R: Runtime>(app: &AppHandle<R>) {

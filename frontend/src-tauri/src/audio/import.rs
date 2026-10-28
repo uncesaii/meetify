@@ -4,9 +4,7 @@ use crate::api::TranscriptSegment;
 use crate::audio::decoder::{decode_audio_file, decode_audio_file_with_progress};
 use crate::audio::vad::get_speech_chunks_with_progress;
 use crate::config::{DEFAULT_WHISPER_MODEL, DEFAULT_PARAKEET_MODEL};
-use crate::parakeet_engine::ParakeetEngine;
 use crate::state::AppState;
-use crate::whisper_engine::WhisperEngine;
 use anyhow::{anyhow, Result};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
@@ -509,16 +507,8 @@ async fn run_import<R: Runtime>(
     emit_progress(&app, "transcribing", 30, "Loading transcription engine...");
 
     // Initialize the appropriate engine
-    let whisper_engine = if !use_parakeet && total_segments > 0 {
-        Some(get_or_init_whisper(&app, model.as_deref()).await?)
-    } else {
-        None
-    };
-    let parakeet_engine = if use_parakeet && total_segments > 0 {
-        Some(get_or_init_parakeet(&app, model.as_deref()).await?)
-    } else {
-        None
-    };
+    let transcription_engine = crate::audio::transcription::engine::get_or_init_transcription_engine(&app).await.map_err(|e| anyhow!("{e}"))?;
+    
 
     // Split very long segments at silence boundaries for better transcription quality.
     // Hard cuts at arbitrary sample positions lose words at boundaries. Instead, scan
@@ -548,6 +538,7 @@ async fn run_import<R: Runtime>(
     // Process each speech segment
     let mut all_transcripts: Vec<(String, f64, f64)> = Vec::new();
     let mut total_confidence = 0.0f32;
+    let mut last_prompt_context: Option<String> = None;
 
     for (i, segment) in processable_segments.iter().enumerate() {
         if IMPORT_CANCELLED.load(Ordering::SeqCst) {
@@ -579,21 +570,13 @@ async fn run_import<R: Runtime>(
             continue;
         }
 
-        // Transcribe
-        let (text, conf) = if use_parakeet {
-            let engine = parakeet_engine.as_ref().unwrap();
-            let text = engine
-                .transcribe_audio(segment.samples.clone())
+        // Transcribe with language preference & prompt context
+        let (text, conf) = {
+            let text = transcription_engine
+                .transcribe_with_options(&segment.samples, 16000, language.clone(), last_prompt_context.clone())
                 .await
-                .map_err(|e| anyhow!("Parakeet transcription failed on segment {}: {}", i, e))?;
-            (text, 0.9f32)
-        } else {
-            let engine = whisper_engine.as_ref().unwrap();
-            let (text, conf, _) = engine
-                .transcribe_audio_with_confidence(segment.samples.clone(), language.clone())
-                .await
-                .map_err(|e| anyhow!("Whisper transcription failed on segment {}: {}", i, e))?;
-            (text, conf)
+                .map_err(|e| anyhow!("Transcription failed on segment {}: {}", i, e))?;
+            (text, 0.95f32)
         };
 
         let trimmed = text.trim();
@@ -603,8 +586,14 @@ async fn run_import<R: Runtime>(
                 i + 1, processable_count, segment_duration_sec, conf,
                 if trimmed.len() > 80 { let mut end = 80; while !trimmed.is_char_boundary(end) { end -= 1; } &trimmed[..end] } else { trimmed }
             );
-            all_transcripts.push((text, segment.start_timestamp_ms, segment.end_timestamp_ms));
+            all_transcripts.push((text.clone(), segment.start_timestamp_ms, segment.end_timestamp_ms));
             total_confidence += conf;
+            let t = text.trim();
+            last_prompt_context = Some(if t.len() > 150 {
+                t[t.len() - 150..].to_string()
+            } else {
+                t.to_string()
+            });
         } else {
             debug!("Segment {}/{}: {:.1}s — empty transcription", i + 1, processable_count, segment_duration_sec);
         }
@@ -749,134 +738,6 @@ async fn create_meeting_with_transcripts(
 }
 
 /// Get or initialize the Whisper engine
-async fn get_or_init_whisper<R: Runtime>(
-    app: &AppHandle<R>,
-    requested_model: Option<&str>,
-) -> Result<Arc<WhisperEngine>> {
-    use crate::whisper_engine::commands::WHISPER_ENGINE;
-
-    let engine = {
-        let guard = WHISPER_ENGINE.lock().unwrap_or_else(|e| e.into_inner());
-        guard.as_ref().cloned()
-    };
-
-    match engine {
-        Some(e) => {
-            let target_model = match requested_model {
-                Some(model) => model.to_string(),
-                None => get_configured_model(app, "whisper").await?,
-            };
-
-            let current_model = e.get_current_model().await;
-            let needs_load = match &current_model {
-                Some(loaded) => loaded != &target_model,
-                None => true,
-            };
-
-            if needs_load {
-                info!(
-                    "Loading Whisper model '{}' (current: {:?})",
-                    target_model, current_model
-                );
-
-                if let Err(e) = e.discover_models().await {
-                    warn!("Model discovery error (continuing): {}", e);
-                }
-
-                e.load_model(&target_model)
-                    .await
-                    .map_err(|e| anyhow!("Failed to load model '{}': {}", target_model, e))?;
-            }
-
-            Ok(e)
-        }
-        None => Err(anyhow!("Whisper engine not initialized")),
-    }
-}
-
-/// Get or initialize the Parakeet engine
-async fn get_or_init_parakeet<R: Runtime>(
-    app: &AppHandle<R>,
-    requested_model: Option<&str>,
-) -> Result<Arc<ParakeetEngine>> {
-    use crate::parakeet_engine::commands::PARAKEET_ENGINE;
-
-    let engine = {
-        let guard = PARAKEET_ENGINE.lock().unwrap_or_else(|e| e.into_inner());
-        guard.as_ref().cloned()
-    };
-
-    match engine {
-        Some(e) => {
-            let target_model = match requested_model {
-                Some(model) => model.to_string(),
-                None => get_configured_model(app, "parakeet").await?,
-            };
-
-            let current_model = e.get_current_model().await;
-            let needs_load = match &current_model {
-                Some(loaded) => loaded != &target_model,
-                None => true,
-            };
-
-            if needs_load {
-                info!(
-                    "Loading Parakeet model '{}' (current: {:?})",
-                    target_model, current_model
-                );
-
-                if let Err(e) = e.discover_models().await {
-                    warn!("Model discovery error (continuing): {}", e);
-                }
-
-                e.load_model(&target_model)
-                    .await
-                    .map_err(|e| anyhow!("Failed to load model '{}': {}", target_model, e))?;
-            }
-
-            Ok(e)
-        }
-        None => Err(anyhow!("Parakeet engine not initialized")),
-    }
-}
-
-/// Get the configured model from database
-async fn get_configured_model<R: Runtime>(app: &AppHandle<R>, provider_type: &str) -> Result<String> {
-    let app_state = app
-        .try_state::<AppState>()
-        .ok_or_else(|| anyhow!("App state not available"))?;
-
-    let result: Option<(String, String)> = sqlx::query_as(
-        "SELECT provider, model FROM transcript_settings WHERE id = '1'",
-    )
-    .fetch_optional(app_state.db_manager.pool())
-    .await
-    .map_err(|e| anyhow!("Failed to query config: {}", e))?;
-
-    match result {
-        Some((provider, model)) => {
-            if (provider_type == "whisper" && (provider == "localWhisper" || provider == "whisper"))
-                || (provider_type == "parakeet" && provider == "parakeet")
-            {
-                Ok(model)
-            } else {
-                // Return default model for the requested type
-                Ok(if provider_type == "parakeet" {
-                    DEFAULT_PARAKEET_MODEL.to_string()
-                } else {
-                    DEFAULT_WHISPER_MODEL.to_string()
-                })
-            }
-        }
-        None => Ok(if provider_type == "parakeet" {
-            DEFAULT_PARAKEET_MODEL.to_string()
-        } else {
-            DEFAULT_WHISPER_MODEL.to_string()
-        }),
-    }
-}
-
-/// Write metadata.json to a meeting folder (atomic write with temp file)
 fn write_import_metadata(
     folder: &Path,
     meeting_id: &str,

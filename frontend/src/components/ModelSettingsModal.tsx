@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useSidebar } from './Sidebar/SidebarProvider';
 import { invoke } from '@tauri-apps/api/core';
 import { Button } from '@/components/ui/button';
@@ -173,6 +173,11 @@ export function ModelSettingsModal({
   const [isLoadingClaude, setIsLoadingClaude] = useState<boolean>(false);
   const [isLoadingGroq, setIsLoadingGroq] = useState<boolean>(false);
 
+  // Model download state fallback
+  const [downloadingModels, setDownloadingModels] = useState<Set<string>>(new Set());
+  const isDownloading = useCallback((modelName: string) => downloadingModels.has(modelName), [downloadingModels]);
+  const getProgress = useCallback((_modelName: string): number | undefined => undefined, []);
+
   // Use global download context instead of local state
   // OllamaDownload removed
 
@@ -240,10 +245,10 @@ export function ModelSettingsModal({
   };
 
   const requiresApiKey =
-    modelConfig.false /* claude removed */ ||
     modelConfig.provider === 'groq' ||
     modelConfig.provider === 'gemini' ||
-    modelConfig.provider === 'openrouter';
+    modelConfig.provider === 'openrouter' ||
+    modelConfig.provider === 'custom-openai';
 
   // Check if Ollama endpoint has changed but models haven't been fetched yet
   const ollamaEndpointChanged = false /* ollama removed */ &&
@@ -377,7 +382,7 @@ export function ModelSettingsModal({
 
   // Reset hasAutoFetched flag and clear models when switching away from Ollama
   useEffect(() => {
-    if (modelConfig.provider !== 'ollama') {
+    if ((modelConfig.provider as string) !== 'ollama') {
       setHasAutoFetched(false); // Reset flag so it can auto-fetch again if user switches back
       setModels([]); // Clear models list
       setError(''); // Clear any error state
@@ -393,9 +398,9 @@ export function ModelSettingsModal({
       // Check if we have cached models for this endpoint (including empty endpoint = default)
       const cachedModels = modelsCache.current.get(ollamaEndpoint.trim());
 
-      if (cachedModels && cachedModels.length > 0) {
+      if (cachedModels && (cachedModels?.length ?? 0) > 0) {
         // Restore cached models and update tracking
-        setModels(cachedModels);
+        setModels(cachedModels || []);
         setLastFetchedEndpoint(ollamaEndpoint.trim());
         setError('');
       } else {
@@ -590,12 +595,7 @@ export function ModelSettingsModal({
     }
   }, [modelConfig.provider, apiKey]);
 
-  // Auto-fetch Claude models when provider is claude and we have an API key
-  useEffect(() => {
-    if (modelConfig.false /* claude removed */ && apiKey?.trim()) {
-      loadClaudeModels(apiKey);
-    }
-  }, [modelConfig.provider, apiKey]);
+  // Auto-fetch Claude models removed
 
   // Auto-fetch Groq models when provider is groq and we have an API key
   useEffect(() => {
@@ -909,7 +909,6 @@ export function ModelSettingsModal({
                     <CommandList className="max-h-[300px]">
                       {(modelConfig.provider === 'openrouter' && isLoadingOpenRouter) ||
                        (modelConfig.provider === 'gemini' && isLoadingOpenAI) ||
-                       (modelConfig.false /* claude removed */ && isLoadingClaude) ||
                        (modelConfig.provider === 'groq' && isLoadingGroq) ? (
                         <div className="py-6 text-center text-sm text-muted-foreground">
                           <RefreshCw className="mx-auto h-4 w-4 animate-spin mb-2" />
@@ -1365,7 +1364,7 @@ export function ModelSettingsModal({
         {/* Built-in AI Models Section */}
         {false /* builtin removed */ && (
           <div className="mt-6">
-            <!-- BuiltInModelManager removed -->
+            {/* BuiltInModelManager removed */}
           </div>
         )}
       </div>

@@ -468,7 +468,7 @@ export function useSummaryGeneration({
     }
 
     try {
-      if (modelConfig.provider === 'ollama') {
+      if ((modelConfig.provider as string) === 'ollama') {
         const models = await invokeTauri<unknown[]>('get_ollama_models', {
           endpoint: modelConfig.ollamaEndpoint || null,
         });
@@ -477,17 +477,7 @@ export function useSummaryGeneration({
           return;
         }
       }
-      // builtin-ai removed
-        const isReady = await invokeTauri<boolean>('builtin_ai_is_model_ready', {
-          modelName: modelConfig.model,
-          refresh: true,
-        });
-        if (!isReady) {
-          showPreflightError('Built-in AI model is not ready. Please check model settings.');
-          onOpenModelSettings?.();
-          return;
-        }
-      }
+      // builtin-ai provider check removed - cloud API providers don't need local model validation
     } catch (error) {
       console.error('Failed to validate summary model:', error);
       showPreflightError('Failed to validate summary model. Please check model settings.');

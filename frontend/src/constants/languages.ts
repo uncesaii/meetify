@@ -3,6 +3,7 @@ export const LANGUAGES = [
   { code: 'auto', name: 'Auto Detect (Original Language)' },
   { code: 'auto-translate', name: 'Auto Detect (Translate to English)' },
   { code: 'en', name: 'English' },
+  { code: 'tl', name: 'Tagalog / Taglish (Filipino)' },
   { code: 'zh', name: 'Chinese' },
   { code: 'de', name: 'German' },
   { code: 'es', name: 'Spanish' },

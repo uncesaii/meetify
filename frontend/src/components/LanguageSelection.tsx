@@ -14,6 +14,7 @@ const LANGUAGES: Language[] = [
   { code: 'auto', name: 'Auto Detect (Original Language)' },
   { code: 'auto-translate', name: 'Auto Detect (Translate to English)' },
   { code: 'en', name: 'English' },
+  { code: 'tl', name: 'Tagalog / Taglish (Filipino)' },
   { code: 'zh', name: 'Chinese' },
   { code: 'de', name: 'German' },
   { code: 'es', name: 'Spanish' },
@@ -102,7 +103,6 @@ const LANGUAGES: Language[] = [
   { code: 'lb', name: 'Luxembourgish' },
   { code: 'my', name: 'Myanmar' },
   { code: 'bo', name: 'Tibetan' },
-  { code: 'tl', name: 'Tagalog' },
   { code: 'mg', name: 'Malagasy' },
   { code: 'as', name: 'Assamese' },
   { code: 'tt', name: 'Tatar' },
@@ -212,8 +212,8 @@ export function LanguageSelection({
           </p>
           {selectedLanguage === 'auto' && (
             <div className="p-2 bg-yellow-50 border border-yellow-200 rounded text-yellow-800">
-              <p className="font-medium">⚠️ Auto Detect may produce incorrect results</p>
-              <p className="mt-1">For best accuracy, select your specific language (e.g., English, Spanish, etc.)</p>
+              <p className="font-medium">✨ Auto Detect (Taglish, Tagalog & English)</p>
+              <p className="mt-1">Automatically recognizes Taglish code-switching, straight Tagalog, and English. You can also select "Tagalog / Taglish (Filipino)" to lock onto Tagalog.</p>
             </div>
           )}
           {selectedLanguage === 'auto-translate' && (

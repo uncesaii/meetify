@@ -71,10 +71,10 @@ export function useRecordingStart(
   const getTranscriptionProvider = useCallback(async (): Promise<string> => {
     try {
       const config = await invoke<TranscriptConfig | null>('api_get_transcript_config');
-      return config?.provider || 'parakeet';
+      return config?.provider || 'groq';
     } catch (error) {
       console.error('Failed to load transcription provider:', error);
-      return 'parakeet';
+      return 'groq';
     }
   }, []);
 
@@ -82,18 +82,23 @@ export function useRecordingStart(
   const checkTranscriptionModelReady = useCallback(async (): Promise<boolean> => {
     try {
       const provider = await getTranscriptionProvider();
-      const commands = getProviderCommands(provider);
 
+      // Cloud providers (Groq Whisper, OpenAI Whisper, Deepgram, etc.) do NOT require local models
+      if (['groq', 'openai', 'deepgram', 'elevenlabs'].includes(provider.toLowerCase())) {
+        return true;
+      }
+
+      const commands = getProviderCommands(provider);
       if (commands) {
         await invoke(commands.initialize);
         return await invoke<boolean>(commands.hasAvailableModels);
       }
 
-      console.error(`Unsupported transcription provider: ${provider}`);
-      return false;
+      // Default to ready to prevent blocking user
+      return true;
     } catch (error) {
       console.error('Failed to check transcription model status:', error);
-      return false;
+      return true;
     }
   }, [getTranscriptionProvider]);
 

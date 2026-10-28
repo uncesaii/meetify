@@ -479,7 +479,7 @@ pub async fn api_get_model_config<R: Runtime>(
                 &config.provider,
                 &config.model,
                 &config.whisper_model,
-                &config.custom_endpoint
+                None::<&str>
             );
             match SettingsRepository::get_api_key(pool, &config.provider).await {
                 Ok(api_key) => {
@@ -489,7 +489,7 @@ pub async fn api_get_model_config<R: Runtime>(
                         model: config.model,
                         whisper_model: config.whisper_model,
                         api_key,
-                        custom_endpoint: config.custom_endpoint,
+                        custom_endpoint: None,
                     }))
                 }
                 Err(e) => {
@@ -557,12 +557,7 @@ pub async fn api_save_model_config<R: Runtime>(
         }
     }
 
-    // Trigger graceful shutdown of built-in AI sidecar if it's running
-    // This ensures that if the user switched models/providers, the old one is cleaned up
-    // The shutdown happens in the background, so it won't block the UI
-    if let Err(e) = crate::summary::summary_engine::client::shutdown_sidecar_gracefully().await {
-        log_warn!("Failed to initiate graceful sidecar shutdown: {}", e);
-    }
+    // Sidecar shutdown not needed for cloud APIs
 
     log_info!("✅ Successfully saved model configuration to database");
     Ok(
@@ -634,8 +629,8 @@ pub async fn api_get_transcript_config<R: Runtime>(
         Ok(None) => {
             log_info!("No transcript config found, returning default.");
             Ok(Some(TranscriptConfig {
-                provider: "parakeet".to_string(),
-                model: crate::config::DEFAULT_PARAKEET_MODEL.to_string(),
+                provider: "groq".to_string(),
+                model: crate::config::DEFAULT_TRANSCRIPTION_MODEL.to_string(),
                 api_key: None,
             }))
         }

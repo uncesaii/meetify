@@ -10,6 +10,7 @@ export interface LanguageOption {
  */
 export const LANGUAGE_OPTIONS: LanguageOption[] = [
   { code: 'en', label: 'English' },
+  { code: 'tl', label: 'Tagalog / Filipino' },
   { code: 'zh', label: 'Chinese' },
   { code: 'zh-tw', label: 'Traditional Chinese' },
   { code: 'de', label: 'German' },

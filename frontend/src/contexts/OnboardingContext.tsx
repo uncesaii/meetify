@@ -485,14 +485,8 @@ export function OnboardingProvider({ children }: { children: React.ReactNode }) 
         setSelectedSummaryModel(modelToSave);
       }
 
-      const selectedModelReady = await invoke<boolean>('builtin_ai_is_model_ready', {
-        modelName: modelToSave,
-        refresh: true,
-      });
-      setSummaryModelDownloaded(selectedModelReady);
-      if (!selectedModelReady) {
-        requestSummaryModelDownload(modelToSave);
-      }
+      // Cloud AI: no local model download required
+      setSummaryModelDownloaded(true);
 
       // Onboarding uses gemini by default
       await invoke('complete_onboarding', {

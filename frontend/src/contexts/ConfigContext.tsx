@@ -100,7 +100,7 @@ const ConfigContext = createContext<ConfigContextType | undefined>(undefined);
 export function ConfigProvider({ children }: { children: ReactNode }) {
   // Model configuration state
   const [modelConfig, setModelConfig] = useState<ModelConfig>({
-    provider: 'ollama',
+    provider: 'gemini',
     model: 'llama3.2:latest',
     whisperModel: 'large-v3',
     ollamaEndpoint: null
@@ -110,7 +110,7 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
 
   // Transcript model configuration state
   const [transcriptModelConfig, setTranscriptModelConfig] = useState<TranscriptModelProps>({
-    provider: 'parakeet',
+    provider: 'groq',
     model: 'parakeet-tdt-0.6b-v3-int8',
     apiKey: null
   });
@@ -202,8 +202,8 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
         if (config) {
           console.log('[ConfigContext] Loaded saved transcript config:', config);
           setTranscriptModelConfig({
-            provider: config.provider || 'parakeet',
-            model: config.model || 'parakeet-tdt-0.6b-v3-int8',
+            provider: config.provider || 'groq',
+            model: config.model || 'whisper-large-v3',
             apiKey: config.apiKey || null
           });
         }
@@ -368,12 +368,10 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
 
   // Calculate model options based on available models
   const modelOptions: Record<ModelConfig['provider'], string[]> = {
-    ollama: models.map(model => model.name),
-    claude: ['claude-3-5-sonnet-latest'],
+    gemini: ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro'],
     groq: ['llama-3.3-70b-versatile'],
     openrouter: [],
-    openai: ['gpt-4', 'gpt-4-turbo', 'gpt-3.5-turbo'],
-        'custom-openai': [],
+    'custom-openai': [],
   };
 
   // Toggle confidence indicator with localStorage persistence
@@ -440,17 +438,25 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
         setNotificationSettings(null);
       }
 
-      // Load storage locations
-      const [dbDir, modelsDir, recordingsDir] = await Promise.all([
-        invoke<string>('get_database_directory'),
-        invoke<string>('whisper_get_models_directory'),
-        invoke<string>('get_default_recordings_folder_path')
-      ]);
+      // Load storage locations safely with individual fallbacks
+      let dbDir = '';
+      try {
+        dbDir = await invoke<string>('get_database_directory');
+      } catch (err) {
+        console.warn('[ConfigContext] Database directory not available:', err);
+      }
+
+      let recordingsDir = '';
+      try {
+        recordingsDir = await invoke<string>('get_default_recordings_folder_path');
+      } catch (err) {
+        console.warn('[ConfigContext] Recordings path not available:', err);
+      }
 
       setStorageLocations({
-        database: dbDir,
-        models: modelsDir,
-        recordings: recordingsDir
+        database: dbDir || 'App Data Directory',
+        models: 'Local Cache',
+        recordings: recordingsDir || 'Documents/Meetify/Recordings'
       });
 
       // Mark as loaded

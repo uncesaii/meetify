@@ -65,14 +65,14 @@ const Sidebar: React.FC = () => {
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [showModelSettings, setShowModelSettings] = useState(false);
   const [modelConfig, setModelConfig] = useState<ModelConfig>({
-    provider: 'ollama',
+    provider: 'gemini',
     model: '',
     whisperModel: '',
     apiKey: null,
     ollamaEndpoint: null
   });
   const [transcriptModelConfig, setTranscriptModelConfig] = useState<TranscriptModelProps>({
-    provider: 'parakeet',
+    provider: 'groq',
     model: 'parakeet-tdt-0.6b-v3-int8',
   });
   const [settingsSaveSuccess, setSettingsSaveSuccess] = useState<boolean | null>(null);

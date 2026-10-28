@@ -5,7 +5,6 @@ import { Switch } from "./ui/switch"
 import { FolderOpen } from "lucide-react"
 import { invoke } from "@tauri-apps/api/core"
 import Analytics from "@/lib/analytics"
-import AnalyticsConsentSwitch from "./AnalyticsConsentSwitch"
 import { useConfig, NotificationSettings } from "@/contexts/ConfigContext"
 
 export function PreferenceSettings() {
@@ -18,6 +17,15 @@ export function PreferenceSettings() {
   } = useConfig();
 
   const [notificationsEnabled, setNotificationsEnabled] = useState<boolean | null>(null);
+  const [recordingsPath, setRecordingsPath] = useState<string>('');
+
+  useEffect(() => {
+    invoke<string>('get_default_recordings_folder_path')
+      .then((path) => {
+        if (path) setRecordingsPath(path);
+      })
+      .catch(() => {});
+  }, []);
   const [isInitialLoad, setIsInitialLoad] = useState(true);
   const [previousNotificationsEnabled, setPreviousNotificationsEnabled] = useState<boolean | null>(null);
   const hasTrackedViewRef = useRef(false);
@@ -201,7 +209,7 @@ export function PreferenceSettings() {
           <div className="p-4 border rounded-lg bg-gray-50">
             <div className="font-medium mb-2">Meeting Recordings</div>
             <div className="text-sm text-gray-600 mb-3 break-all font-mono text-xs">
-              {storageLocations?.recordings || 'Loading...'}
+              {recordingsPath || storageLocations?.recordings || 'Documents/Meetify/Recordings'}
             </div>
             <button
               onClick={() => handleOpenFolder('recordings')}
@@ -220,10 +228,7 @@ export function PreferenceSettings() {
         </div>
       </div>
 
-      {/* Analytics Section */}
-      <div className="bg-white rounded-lg border border-gray-200 p-6 shadow-sm">
-        <AnalyticsConsentSwitch />
-      </div>
+      
     </div>
   )
 }

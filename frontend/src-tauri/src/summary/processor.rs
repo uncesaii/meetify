@@ -170,6 +170,7 @@ pub(crate) fn language_name_from_code(code: &str) -> Option<&'static str> {
     };
     match lookup {
         "en" => Some("English"),
+        "tl" => Some("Tagalog"),
         "zh" => Some("Chinese"),
         "de" => Some("German"),
         "es" => Some("Spanish"),

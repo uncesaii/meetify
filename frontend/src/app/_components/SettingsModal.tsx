@@ -124,7 +124,7 @@ export function SettingsModals({
                     </select>
                   </div>
                 </div>
-                {modelConfig.provider === 'ollama' && (
+                {(modelConfig.provider as string) === 'ollama' && (
                   <div>
                     <h4 className="text-lg font-bold mb-4">Available Ollama Models</h4>
                     {error && (

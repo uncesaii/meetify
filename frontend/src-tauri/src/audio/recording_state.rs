@@ -153,6 +153,11 @@ impl RecordingState {
         Ok(())
     }
 
+    /// Reset recording start time to now (call when streams are fully live)
+    pub fn reset_start_time(&self) {
+        *self.recording_start.lock().unwrap() = Some(Instant::now());
+    }
+
     pub fn stop_recording(&self) {
         self.is_recording.store(false, Ordering::SeqCst);
         self.is_paused.store(false, Ordering::SeqCst);

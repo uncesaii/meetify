@@ -9,7 +9,6 @@ use crate::summary::processor::{
     language_name_from_code, require_visible_markdown,
 };
 use crate::summary::templates::{self, Template};
-use crate::ollama::metadata::ModelMetadataCache;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -21,8 +20,7 @@ use tauri::{AppHandle, Manager};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-static METADATA_CACHE: LazyLock<ModelMetadataCache> =
-    LazyLock::new(|| ModelMetadataCache::new(Duration::from_secs(300)));
+// METADATA_CACHE removed
 
 #[derive(Clone)]
 struct RegisteredCancellation {
@@ -381,12 +379,6 @@ impl SummaryService {
 
         // Ollama removed - no local endpoint needed
         let ollama_endpoint: Option<String> = None;
-                    None
-                }
-            }
-        } else {
-            None
-        };
 
         // Get CustomOpenAI config if provider is CustomOpenAI
         let (custom_openai_endpoint, custom_openai_api_key, custom_openai_max_tokens, custom_openai_temperature, custom_openai_top_p) =
@@ -425,50 +417,7 @@ impl SummaryService {
         };
 
         // Dynamically fetch context size based on provider and model
-        let token_threshold = if provider == LLMProvider::Ollama {
-            match METADATA_CACHE.get_or_fetch(&model_name, ollama_endpoint.as_deref()).await {
-                Ok(metadata) => {
-                    // Reserve 300 tokens for prompt overhead
-                    let optimal = metadata.context_size.saturating_sub(300);
-                    info!(
-                        "✓ Using dynamic context for {}: {} tokens (chunk size: {})",
-                        model_name, metadata.context_size, optimal
-                    );
-                    optimal
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to fetch context for {}: {}. Using default 4000",
-                        model_name, e
-                    );
-                    4000  // Fallback to safe default
-                }
-            }
-        } else if provider == LLMProvider::BuiltInAI {
-            // Get model's context size from registry
-            use crate::summary::summary_engine::models;
-            let model = models::get_model_by_name(&model_name)
-                .ok_or_else(|| format!("Unknown model: {}", model_name));
-
-            match model {
-                Ok(model_def) => {
-                    // Reserve 300 tokens for prompt overhead
-                    let optimal = model_def.context_size.saturating_sub(300) as usize;
-                    info!(
-                        "✓ Using BuiltInAI context size: {} tokens (chunk size: {})",
-                        model_def.context_size, optimal
-                    );
-                    optimal
-                }
-                Err(e) => {
-                    warn!("{}, using default 2048", e);
-                    1748  // 2048 - 300 for overhead
-                }
-            }
-        } else {
-            // Cloud providers handle large contexts automatically
-            100000  // Effectively unlimited for single-pass processing
-        };
+        let token_threshold: usize = 100000; // Cloud providers handle large contexts automatically
 
         // No local provider - no app data dir needed
         let app_data_dir = _app.path().app_data_dir().ok();

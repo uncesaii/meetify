@@ -276,31 +276,30 @@ impl ContinuousVadProcessor {
                     self.speech_start_sample = timestamp_ms * VAD_SAMPLE_RATE as usize / 1000;
                     self.current_speech.clear();
                 }
-                VadTransition::SpeechEnd { start_timestamp_ms, end_timestamp_ms, samples } => {
+                VadTransition::SpeechEnd { start_timestamp_ms: _, end_timestamp_ms: _, samples: _ } => {
                     // Only log if we were previously in speech state
                     if self.last_logged_state {
-                        debug!("VAD: Speech ended at {}ms (duration: {}ms)", end_timestamp_ms, end_timestamp_ms - start_timestamp_ms);
+                        debug!("VAD: Speech ended");
                         self.last_logged_state = false;
                     }
                     self.in_speech = false;
 
-                    // Use samples from VAD transition if available, otherwise use accumulated samples
-                    let speech_samples = if !samples.is_empty() {
-                        samples
-                    } else {
-                        self.current_speech.clone()
-                    };
+                    // Use accumulated samples from current speech window (respecting any bounded splits)
+                    let speech_samples = self.current_speech.clone();
 
                     if !speech_samples.is_empty() {
+                        let start_ms = (self.speech_start_sample as f64 / VAD_SAMPLE_RATE as f64) * 1000.0;
+                        let end_ms = start_ms + (speech_samples.len() as f64 / VAD_SAMPLE_RATE as f64) * 1000.0;
+
                         let segment = SpeechSegment {
                             samples: speech_samples,
-                            start_timestamp_ms: start_timestamp_ms as f64,
-                            end_timestamp_ms: end_timestamp_ms as f64,
+                            start_timestamp_ms: start_ms,
+                            end_timestamp_ms: end_ms,
                             confidence: 0.9, // VAD confidence
                         };
 
                         info!("VAD: Completed speech segment: {:.1}ms duration, {} samples",
-                              end_timestamp_ms - start_timestamp_ms, segment.samples.len());
+                              end_ms - start_ms, segment.samples.len());
 
                         self.speech_segments.push_back(segment);
                     }
@@ -313,6 +312,50 @@ impl ContinuousVadProcessor {
         // Accumulate speech if we're currently in a speech state
         if self.in_speech {
             self.current_speech.extend_from_slice(chunk);
+
+            // BOUNDED LIVE SEGMENTATION:
+            // Continuous speech without pauses (e.g. uninterrupted monologue, background hum)
+            // can withhold transcription for 30-60+ seconds and overflow Whisper's 30s context window.
+            // When continuous speech reaches 10 seconds (160,000 samples), find the quietest 100ms
+            // window (inter-word breath/pause) in the 6s-9s range and emit a segment.
+            const MAX_CONTINUOUS_SPEECH_SAMPLES: usize = 16000 * 10; // 10 seconds
+            if self.current_speech.len() >= MAX_CONTINUOUS_SPEECH_SAMPLES {
+                let search_start = 16000 * 6; // from second 6
+                let search_end = 16000 * 9;   // to second 9
+                let energy_window = 1600;     // 100ms window
+
+                let mut best_split = 16000 * 8; // fallback to 8s
+                let mut best_rms = f32::MAX;
+
+                let mut idx = search_start;
+                while idx + energy_window <= search_end && idx + energy_window <= self.current_speech.len() {
+                    let window = &self.current_speech[idx..idx + energy_window];
+                    let rms = (window.iter().map(|&s| s * s).sum::<f32>() / energy_window as f32).sqrt();
+                    if rms < best_rms {
+                        best_rms = rms;
+                        best_split = idx + energy_window / 2;
+                    }
+                    idx += 160; // step by 10ms
+                }
+
+                if best_split > 0 && best_split < self.current_speech.len() {
+                    let segment_samples = self.current_speech[..best_split].to_vec();
+                    let start_ms = (self.speech_start_sample as f64 / VAD_SAMPLE_RATE as f64) * 1000.0;
+                    let end_ms = start_ms + (segment_samples.len() as f64 / VAD_SAMPLE_RATE as f64) * 1000.0;
+
+                    let segment = SpeechSegment {
+                        samples: segment_samples,
+                        start_timestamp_ms: start_ms,
+                        end_timestamp_ms: end_ms,
+                        confidence: 0.9,
+                    };
+                    info!("VAD bounded split: Emitting {:.1}s segment (quiet-point RMS: {:.4})", (end_ms - start_ms) / 1000.0, best_rms);
+                    self.speech_segments.push_back(segment);
+
+                    self.current_speech.drain(..best_split);
+                    self.speech_start_sample += best_split;
+                }
+            }
         }
 
         self.processed_samples += chunk.len();

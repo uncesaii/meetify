@@ -1,4 +1,4 @@
-﻿// audio/recording_commands.rs
+// audio/recording_commands.rs
 //
 // Slim Tauri command layer for recording functionality.
 // Delegates to transcription and recording modules for actual implementation.
@@ -419,11 +419,12 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
 
     // Spawn background device event processor (mic-disconnect fallback).
     if let Some(receiver) = device_event_receiver {
-        spawn_device_event_processor(app.clone(), receiver, session);
+        spawn_device_event_processor(app.clone(), receiver, session.clone());
     }
 
     // Flip recording live + reset per-session flags (speech-detected latch,
     // mic-recovery budget). Shared with the other start path â€” see helper.
+    session.reset_start_time();
     finalize_recording_start();
     drop(engine_lifecycle_guard);
 
@@ -606,11 +607,12 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
 
     // Spawn background device event processor (mic-disconnect fallback).
     if let Some(receiver) = device_event_receiver {
-        spawn_device_event_processor(app.clone(), receiver, session);
+        spawn_device_event_processor(app.clone(), receiver, session.clone());
     }
 
     // Flip recording live + reset per-session flags (speech-detected latch,
     // mic-recovery budget). Shared with the other start path â€” see helper.
+    session.reset_start_time();
     finalize_recording_start();
     drop(engine_lifecycle_guard);
 
@@ -845,59 +847,7 @@ pub async fn stop_recording<R: Runtime>(
         }
     };
 
-    match config.as_deref() {
-        Some("parakeet") => {
-            info!("ðŸ¦œ Unloading Parakeet model...");
-            let engine_clone = {
-                let engine_guard = crate::parakeet_engine::commands::PARAKEET_ENGINE
-                    .lock()
-                    .unwrap();
-                engine_guard.as_ref().cloned()
-            };
-
-            if let Some(engine) = engine_clone {
-                let current_model = engine
-                    .get_current_model()
-                    .await
-                    .unwrap_or_else(|| "unknown".to_string());
-                info!("Current Parakeet model before unload: '{}'", current_model);
-
-                if engine.unload_model().await {
-                    info!("âœ… Parakeet model '{}' unloaded successfully", current_model);
-                } else {
-                    warn!("âš ï¸ Failed to unload Parakeet model '{}'", current_model);
-                }
-            } else {
-                warn!("âš ï¸ No Parakeet engine found to unload model");
-            }
-        }
-        _ => {
-            // Default to Whisper
-            info!("ðŸŽ¤ Unloading Whisper model...");
-            let engine_clone = {
-                let engine_guard = crate::whisper_engine::commands::WHISPER_ENGINE
-                    .lock()
-                    .unwrap();
-                engine_guard.as_ref().cloned()
-            };
-
-            if let Some(engine) = engine_clone {
-                let current_model = engine
-                    .get_current_model()
-                    .await
-                    .unwrap_or_else(|| "unknown".to_string());
-                info!("Current Whisper model before unload: '{}'", current_model);
-
-                if engine.unload_model().await {
-                    info!("âœ… Whisper model '{}' unloaded successfully", current_model);
-                } else {
-                    warn!("âš ï¸ Failed to unload Whisper model '{}'", current_model);
-                }
-            } else {
-                warn!("âš ï¸ No Whisper engine found to unload model");
-            }
-        }
-    }
+    // No local models to unload for cloud API
 
     // Step 3.5: Track meeting ended analytics with privacy-safe metadata
     // Extract all data from manager BEFORE any async operations to avoid Send issues

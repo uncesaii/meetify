@@ -1,4 +1,4 @@
-﻿use std::sync::Arc;
+use std::sync::Arc;
 use std::collections::VecDeque;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -12,6 +12,7 @@ use super::devices::AudioDevice;
 use super::recording_state::{AudioChunk, AudioError, RecordingState, DeviceType};
 use super::audio_processing::{audio_to_mono, LoudnessNormalizer, NoiseSuppressionProcessor, HighPassFilter};
 use super::vad::{ContinuousVadProcessor};
+use super::common::split_segment_at_silence;
 
 /// How long a silence must last before the VAD closes a speech segment, and
 /// therefore how long the audio clips handed to the ASR engine are.
@@ -859,7 +860,15 @@ impl AudioPipeline {
                             // STEP 3: Send mixed audio for transcription (VAD + Whisper)
                             match self.vad_processor.process_audio(&mixed_with_gain) {
                                 Ok(speech_segments) => {
-                                    for segment in speech_segments {
+                                    let mut segments_to_send = Vec::new();
+                                    for seg in speech_segments {
+                                        if seg.samples.len() > 16000 * 20 {
+                                            segments_to_send.extend(split_segment_at_silence(&seg, 16000 * 10));
+                                        } else {
+                                            segments_to_send.push(seg);
+                                        }
+                                    }
+                                    for segment in segments_to_send {
                                         let duration_ms = segment.end_timestamp_ms - segment.start_timestamp_ms;
 
                                         if segment.samples.len() >= 800 {  // Minimum 50ms at 16kHz - matches Parakeet capability
@@ -928,7 +937,15 @@ impl AudioPipeline {
         // Flush any remaining audio from VAD processor and send segments to transcription
         match self.vad_processor.flush() {
             Ok(final_segments) => {
-                for segment in final_segments {
+                let mut segments_to_send = Vec::new();
+                for seg in final_segments {
+                    if seg.samples.len() > 16000 * 20 {
+                        segments_to_send.extend(split_segment_at_silence(&seg, 16000 * 10));
+                    } else {
+                        segments_to_send.push(seg);
+                    }
+                }
+                for segment in segments_to_send {
                     let duration_ms = segment.end_timestamp_ms - segment.start_timestamp_ms;
 
                     // Send segments >= 50ms (800 samples at 16kHz) - matches main pipeline filter

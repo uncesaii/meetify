@@ -2,6 +2,9 @@
 
 /experiments
 
+# Built binaries and runtime dependencies (too large for git)
+/bin/
+
 # dependencies
 /node_modules
 **/models

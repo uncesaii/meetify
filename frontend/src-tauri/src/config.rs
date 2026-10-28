@@ -6,3 +6,6 @@ pub const DEFAULT_SUMMARY_MODEL: &str = "gemini-2.0-flash";
 
 /// Default Groq model for transcription (Whisper via Groq API).
 pub const DEFAULT_TRANSCRIPTION_MODEL: &str = "whisper-large-v3";
+
+pub const DEFAULT_WHISPER_MODEL: &str = DEFAULT_TRANSCRIPTION_MODEL;
+pub const DEFAULT_PARAKEET_MODEL: &str = DEFAULT_TRANSCRIPTION_MODEL;

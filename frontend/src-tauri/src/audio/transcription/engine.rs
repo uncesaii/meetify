@@ -1,443 +1,446 @@
 // audio/transcription/engine.rs
 //
-// TranscriptionEngine enum and model initialization/validation logic.
+// Transcription engine - uses Groq Whisper API for speech-to-text with accuracy optimizations.
 
-use super::provider::TranscriptionProvider;
-use log::{info, warn};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, Runtime};
+use tracing::{info, warn};
 
-// ============================================================================
-// TRANSCRIPTION ENGINE ENUM
-// ============================================================================
-
-// Transcription engine abstraction to support multiple providers
+/// Transcription engine enum
 pub enum TranscriptionEngine {
-    Whisper(Arc<crate::whisper_engine::WhisperEngine>),  // Direct access (backward compat)
-    Parakeet(Arc<crate::parakeet_engine::ParakeetEngine>), // Direct access (backward compat)
-    Provider(Arc<dyn TranscriptionProvider>),  // Trait-based (preferred for new code)
+    GroqApi {
+        api_key: String,
+        model: String,
+    },
+    /// Legacy variant kept for compatibility - wraps a trait-based provider
+    Provider(Arc<dyn super::provider::TranscriptionProvider>),
+}
+
+impl Clone for TranscriptionEngine {
+    fn clone(&self) -> Self {
+        match self {
+            TranscriptionEngine::GroqApi { api_key, model } => TranscriptionEngine::GroqApi {
+                api_key: api_key.clone(),
+                model: model.clone(),
+            },
+            TranscriptionEngine::Provider(p) => TranscriptionEngine::Provider(p.clone()),
+        }
+    }
 }
 
 impl TranscriptionEngine {
-    /// Check if the engine has a model loaded
     pub async fn is_model_loaded(&self) -> bool {
-        match self {
-            Self::Whisper(engine) => engine.is_model_loaded().await,
-            Self::Parakeet(engine) => engine.is_model_loaded().await,
-            Self::Provider(provider) => provider.is_model_loaded().await,
-        }
+        // Groq API is always ready (no local model to load)
+        true
     }
 
-    /// Get the current model name
-    pub async fn get_current_model(&self) -> Option<String> {
-        match self {
-            Self::Whisper(engine) => engine.get_current_model().await,
-            Self::Parakeet(engine) => engine.get_current_model().await,
-            Self::Provider(provider) => provider.get_current_model().await,
-        }
-    }
-
-    /// Get the provider name for logging
     pub fn provider_name(&self) -> &str {
         match self {
-            Self::Whisper(_) => "Whisper (direct)",
-            Self::Parakeet(_) => "Parakeet (direct)",
-            Self::Provider(provider) => provider.provider_name(),
+            TranscriptionEngine::GroqApi { .. } => "groq",
+            TranscriptionEngine::Provider(_) => "provider",
         }
+    }
+
+    pub fn get_current_model(&self) -> Option<String> {
+        match self {
+            TranscriptionEngine::GroqApi { model, .. } => Some(model.clone()),
+            TranscriptionEngine::Provider(_) => Some("api-provider".to_string()),
+        }
+    }
+
+    pub async fn transcribe(&self, audio_samples: &[f32], sample_rate: u32) -> Result<String, String> {
+        self.transcribe_with_options(audio_samples, sample_rate, None, None).await
+    }
+
+    pub async fn transcribe_with_options(
+        &self,
+        audio_samples: &[f32],
+        sample_rate: u32,
+        language: Option<String>,
+        prompt: Option<String>,
+    ) -> Result<String, String> {
+        match self {
+            TranscriptionEngine::GroqApi { api_key, model } => {
+                transcribe_with_groq(
+                    api_key,
+                    model,
+                    audio_samples,
+                    sample_rate,
+                    language.as_deref(),
+                    prompt.as_deref(),
+                )
+                .await
+            }
+            TranscriptionEngine::Provider(provider) => {
+                let result = provider
+                    .transcribe(audio_samples.to_vec(), language)
+                    .await
+                    .map_err(|e| format!("Transcription error: {}", e))?;
+                Ok(result.text)
+            }
+        }
+    }
+
+    pub async fn unload_model(&self) {
+        // No-op for API-based transcription
     }
 }
 
-// ============================================================================
-// MODEL VALIDATION AND INITIALIZATION
-// ============================================================================
+/// Transcribe audio using Groq Whisper API with accuracy-enhancing settings
+async fn transcribe_with_groq(
+    api_key: &str,
+    model: &str,
+    audio_samples: &[f32],
+    sample_rate: u32,
+    language: Option<&str>,
+    prompt: Option<&str>,
+) -> Result<String, String> {
+    // 1. Guard: Skip tiny audio fragments (< 200ms at 16kHz) to avoid Whisper hallucinations
+    if audio_samples.len() < 3200 {
+        return Ok(String::new());
+    }
 
-/// Validate that transcription models (Whisper or Parakeet) are ready before starting recording
-pub async fn validate_transcription_model_ready<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
-    // Check transcript configuration to determine which engine to validate
-    let config = match crate::api::api::api_get_transcript_config(
-        app.clone(),
-        app.clone().state(),
-        None,
-    )
-    .await
-    {
-        Ok(Some(config)) => {
-            info!(
-                "📝 Found transcript config - provider: {}, model: {}",
-                config.provider, config.model
-            );
-            config
-        }
-        Ok(None) => {
-            info!("📝 No transcript config found, defaulting to parakeet");
-            crate::api::api::TranscriptConfig {
-                provider: "parakeet".to_string(),
-                model: crate::config::DEFAULT_PARAKEET_MODEL.to_string(),
-                api_key: None,
+    // 2. Guard: Skip silence / background noise below speech energy floor
+    let raw_peak = audio_samples.iter().fold(0.0f32, |acc, &s| acc.max(s.abs()));
+    if raw_peak < 0.008 {
+        return Ok(String::new());
+    }
+
+    // Convert samples to 16-bit PCM WAV with dynamic gain normalization & DC offset removal
+    let wav_data = samples_to_wav(audio_samples, sample_rate)?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+
+    let effective_model = if model.trim().is_empty() {
+        "whisper-large-v3"
+    } else {
+        model.trim()
+    };
+
+    let mut form = reqwest::multipart::Form::new()
+        .text("model", effective_model.to_string())
+        .text("response_format", "text")
+        // Temperature 0.0 enforces greedy decoding (eliminates hallucinations and creative deviations)
+        .text("temperature", "0.0")
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(wav_data)
+                .file_name("audio.wav")
+                .mime_str("audio/wav")
+                .map_err(|e| format!("MIME error: {}", e))?,
+        );
+
+    // Route endpoint and language according to user selection
+    let (endpoint, resolved_lang) = match language {
+        Some(l) => {
+            let clean = l.trim().to_lowercase();
+            if clean == "auto-translate" {
+                // OpenAI / Groq audio translations endpoint translates any language directly into English
+                ("https://api.groq.com/openai/v1/audio/translations", None)
+            } else if clean.is_empty() || clean == "auto" {
+                // Auto-detect: do NOT set language param so Whisper's language-identification head auto-detects
+                ("https://api.groq.com/openai/v1/audio/transcriptions", None)
+            } else if clean == "tl" || clean == "fil" || clean == "tagalog" || clean == "taglish" {
+                // Tagalog / Taglish: Whisper uses 'tl' ISO code
+                ("https://api.groq.com/openai/v1/audio/transcriptions", Some("tl"))
+            } else {
+                ("https://api.groq.com/openai/v1/audio/transcriptions", Some(l.trim()))
             }
         }
-        Err(e) => {
-            warn!("⚠️ Failed to get transcript config: {}, defaulting to parakeet", e);
-            crate::api::api::TranscriptConfig {
-                provider: "parakeet".to_string(),
-                model: crate::config::DEFAULT_PARAKEET_MODEL.to_string(),
-                api_key: None,
+        None => ("https://api.groq.com/openai/v1/audio/transcriptions", None), // Default: Auto-detect
+    };
+
+    if let Some(lang) = resolved_lang {
+        form = form.text("language", lang.to_string());
+    }
+
+    // Align with Meetily production architecture:
+    // Do NOT pass synthetic scripted dialogues in prompt — Whisper hallucinates them!
+    // If genuine preceding transcript context exists, pass only recent clean text for natural flow.
+    if let Some(p) = prompt {
+        let clean_p = p.trim();
+        if !clean_p.is_empty() {
+            let slice = if clean_p.len() > 150 {
+                &clean_p[clean_p.len() - 150..]
+            } else {
+                clean_p
+            };
+            form = form.text("prompt", slice.to_string());
+        }
+    }
+
+    let response = client
+        .post(endpoint)
+        .header("Authorization", format!("Bearer {}", api_key.trim()))
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| format!("Groq API request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("Groq API error {}: {}", status, body));
+    }
+
+    let text = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read response: {}", e))?;
+
+    // Apply Meetily production anti-hallucination & anti-repetition cleaning
+    let cleaned = clean_repetitive_text(&text);
+    Ok(cleaned)
+}
+
+/// Clean repetitive text and filter hallucinations (aligned with Meetily production)
+pub fn clean_repetitive_text(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    // Check for obviously meaningless patterns first
+    if is_meaningless_output(trimmed) {
+        return String::new();
+    }
+
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    if words.len() < 3 {
+        return trimmed.to_string();
+    }
+
+    // Enhanced repetition detection with sliding window
+    let cleaned_words = remove_word_repetitions(&words);
+
+    // Remove phrase repetitions with variable length detection
+    let cleaned_words = remove_phrase_repetitions(&cleaned_words);
+
+    // Check for overall repetition ratio
+    let final_text = cleaned_words.join(" ");
+    if calculate_repetition_ratio(&final_text) > 0.60 {
+        return String::new();
+    }
+
+    final_text
+}
+
+// Check for obviously meaningless / hallucinated patterns
+fn is_meaningless_output(text: &str) -> bool {
+    let text_lower = text.to_lowercase();
+
+    let meaningless_patterns = [
+        "thank you for watching",
+        "thanks for watching",
+        "like and subscribe",
+        "please subscribe",
+        "subtitles by",
+        "translated by",
+        "music playing",
+        "applause",
+        "laughter",
+        "um um um",
+        "uh uh uh",
+        "ah ah ah",
+        "salamat sa panonood",
+        "maraming salamat sa panonood",
+        "[blank_audio]",
+        "[silence]",
+        "(silence)",
+        "[music]",
+        "(music)",
+        "[applause]",
+        "(applause)",
+    ];
+
+    for pattern in &meaningless_patterns {
+        if text_lower.contains(pattern) {
+            return true;
+        }
+    }
+
+    // Check if text is mostly the same character or very short repetitive patterns
+    let unique_chars: HashSet<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+    if unique_chars.len() <= 3 && text.len() > 10 {
+        return true;
+    }
+
+    false
+}
+
+// Consecutive word repetition removal
+fn remove_word_repetitions<'a>(words: &'a [&'a str]) -> Vec<&'a str> {
+    let mut cleaned_words = Vec::new();
+    let mut i = 0;
+
+    while i < words.len() {
+        let current_word = words[i];
+        let mut repeat_count = 1;
+
+        while i + repeat_count < words.len() && words[i + repeat_count].eq_ignore_ascii_case(current_word) {
+            repeat_count += 1;
+        }
+
+        if repeat_count >= 2 {
+            cleaned_words.push(current_word);
+            i += repeat_count;
+        } else {
+            cleaned_words.push(current_word);
+            i += 1;
+        }
+    }
+
+    cleaned_words
+}
+
+// Consecutive phrase repetition removal (2 to 5 words)
+fn remove_phrase_repetitions<'a>(words: &'a [&'a str]) -> Vec<&'a str> {
+    if words.len() < 4 {
+        return words.to_vec();
+    }
+
+    let mut final_words = Vec::new();
+    let mut i = 0;
+
+    while i < words.len() {
+        let mut phrase_found = false;
+
+        for phrase_len in 2..=std::cmp::min(5, (words.len() - i) / 2) {
+            if i + phrase_len * 2 <= words.len() {
+                let phrase1 = &words[i..i + phrase_len];
+                let phrase2 = &words[i + phrase_len..i + phrase_len * 2];
+
+                let match_phrase = phrase1.iter().zip(phrase2.iter()).all(|(a, b)| a.eq_ignore_ascii_case(b));
+                if match_phrase {
+                    final_words.extend_from_slice(phrase1);
+                    i += phrase_len * 2;
+                    phrase_found = true;
+                    break;
+                }
             }
+        }
+
+        if !phrase_found {
+            final_words.push(words[i]);
+            i += 1;
+        }
+    }
+
+    final_words
+}
+
+// Calculate repetition ratio in text
+fn calculate_repetition_ratio(text: &str) -> f32 {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.len() < 4 {
+        return 0.0;
+    }
+
+    let mut word_counts = HashMap::new();
+    for word in &words {
+        *word_counts.entry(word.to_lowercase()).or_insert(0) += 1;
+    }
+
+    let total_words = words.len() as f32;
+    let repeated_words: usize = word_counts.values().map(|&count| if count > 1 { count - 1 } else { 0 }).sum();
+
+    repeated_words as f32 / total_words
+}
+
+fn samples_to_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>, String> {
+    if samples.is_empty() {
+        return Err("Audio samples empty".to_string());
+    }
+
+    // DC offset removal: microphone bias can shift center and degrade log-mel spectrograms
+    let mean = samples.iter().sum::<f32>() / samples.len() as f32;
+
+    // Dynamic gain normalization: Whisper log-mel spectrogram features require good signal amplitude.
+    let centered_samples: Vec<f32> = samples.iter().map(|&s| s - mean).collect();
+    let peak = centered_samples.iter().fold(0.0f32, |acc, &s| acc.max(s.abs()));
+    let gain = if peak > 0.005 && peak < 0.70 {
+        // Boost quiet audio up to 3.5x while keeping headroom below clipping
+        (0.85 / peak).min(3.5)
+    } else {
+        1.0
+    };
+
+    let num_samples = centered_samples.len();
+    let data_size = (num_samples * 2) as u32;
+    let mut wav = Vec::with_capacity(44 + data_size as usize);
+
+    // RIFF header
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_size).to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes()); // PCM
+    wav.extend_from_slice(&1u16.to_le_bytes());  // mono
+    wav.extend_from_slice(&1u16.to_le_bytes());  // 1 channel
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_size.to_le_bytes());
+
+    for &s in &centered_samples {
+        let normalized = s * gain;
+        let clamped = normalized.max(-1.0).min(1.0);
+        wav.extend_from_slice(&((clamped * 32767.0) as i16).to_le_bytes());
+    }
+    Ok(wav)
+}
+
+/// Validate transcription model is ready
+pub async fn validate_transcription_model_ready<R: Runtime>(
+    app: &AppHandle<R>,
+) -> Result<(), String> {
+    let state = app.state::<crate::state::AppState>();
+    let pool = state.db_manager.pool();
+    let api_key = match crate::database::repositories::setting::SettingsRepository::get_transcript_api_key(pool, "groq").await {
+        Ok(Some(k)) if !k.is_empty() => k,
+        _ => match crate::database::repositories::setting::SettingsRepository::get_api_key(pool, "groq").await {
+            Ok(Some(k)) => k,
+            _ => std::env::var("GROQ_API_KEY").unwrap_or_default(),
         }
     };
 
-    // Validate based on provider
-    match config.provider.as_str() {
-        "localWhisper" => {
-            info!("🔍 Validating Whisper model...");
-            // Ensure whisper engine is initialized first
-            if let Err(init_error) = crate::whisper_engine::commands::whisper_init().await {
-                warn!("❌ Failed to initialize Whisper engine: {}", init_error);
-                return Err(format!(
-                    "Failed to initialize speech recognition: {}",
-                    init_error
-                ));
-            }
-
-            // Call the whisper validation command with config support
-            match crate::whisper_engine::commands::whisper_validate_model_ready_with_config(app).await {
-                Ok(model_name) => {
-                    info!("✅ Whisper model validation successful: {} is ready", model_name);
-                    Ok(())
-                }
-                Err(e) => {
-                    warn!("❌ Whisper model validation failed: {}", e);
-                    Err(e)
-                }
-            }
-        }
-        "parakeet" => {
-            info!("🔍 Validating Parakeet model...");
-            // Ensure parakeet engine is initialized first
-            if let Err(init_error) = crate::parakeet_engine::commands::parakeet_init().await {
-                warn!("❌ Failed to initialize Parakeet engine: {}", init_error);
-                return Err(format!(
-                    "Failed to initialize Parakeet speech recognition: {}",
-                    init_error
-                ));
-            }
-
-            // Use the validation command that includes auto-discovery and loading
-            // This matches the Whisper behavior for consistency
-            match crate::parakeet_engine::commands::parakeet_validate_model_ready_with_config(app).await {
-                Ok(model_name) => {
-                    info!("✅ Parakeet model validation successful: {} is ready", model_name);
-                    Ok(())
-                }
-                Err(e) => {
-                    warn!("❌ Parakeet model validation failed: {}", e);
-                    Err(e)
-                }
-            }
-        }
-        other => {
-            warn!("❌ Unsupported transcription provider for local recording: {}", other);
-            Err(format!(
-                "Provider '{}' is not supported for local transcription. Please select 'localWhisper' or 'parakeet'.",
-                other
-            ))
-        }
+    if api_key.is_empty() {
+        return Err("Groq API key not configured. Set it in Settings > Transcription.".to_string());
     }
+    Ok(())
 }
 
-/// Get or initialize the appropriate transcription engine based on provider configuration
+/// Get or initialize the transcription engine
 pub async fn get_or_init_transcription_engine<R: Runtime>(
     app: &AppHandle<R>,
 ) -> Result<TranscriptionEngine, String> {
-    // Get provider configuration from API
-    let config = match crate::api::api::api_get_transcript_config(
-        app.clone(),
-        app.clone().state(),
-        None,
-    )
-    .await
-    {
-        Ok(Some(config)) => {
-            info!(
-                "📝 Transcript config - provider: {}, model: {}",
-                config.provider, config.model
-            );
-            config
-        }
-        Ok(None) => {
-            info!("📝 No transcript config found, defaulting to parakeet");
-            crate::api::api::TranscriptConfig {
-                provider: "parakeet".to_string(),
-                model: crate::config::DEFAULT_PARAKEET_MODEL.to_string(),
-                api_key: None,
-            }
-        }
-        Err(e) => {
-            warn!("⚠️ Failed to get transcript config: {}, defaulting to parakeet", e);
-            crate::api::api::TranscriptConfig {
-                provider: "parakeet".to_string(),
-                model: crate::config::DEFAULT_PARAKEET_MODEL.to_string(),
-                api_key: None,
-            }
+    let state = app.state::<crate::state::AppState>();
+    let pool = state.db_manager.pool();
+    let api_key = match crate::database::repositories::setting::SettingsRepository::get_transcript_api_key(pool, "groq").await {
+        Ok(Some(k)) if !k.is_empty() => k,
+        _ => match crate::database::repositories::setting::SettingsRepository::get_api_key(pool, "groq").await {
+            Ok(Some(k)) => k,
+            _ => std::env::var("GROQ_API_KEY").unwrap_or_default(),
         }
     };
 
-    // Initialize the appropriate engine based on provider
-    match config.provider.as_str() {
-        "parakeet" => {
-            info!("🦜 Initializing Parakeet transcription engine");
-
-            // Get Parakeet engine
-            let engine = {
-                let guard = crate::parakeet_engine::commands::PARAKEET_ENGINE
-                    .lock()
-                    .unwrap();
-                guard.as_ref().cloned()
-            };
-
-            match engine {
-                Some(engine) => {
-                    // Check if model is loaded
-                    if engine.is_model_loaded().await {
-                        let model_name = engine.get_current_model().await
-                            .unwrap_or_else(|| "unknown".to_string());
-                        info!("✅ Parakeet model '{}' already loaded", model_name);
-                        Ok(TranscriptionEngine::Parakeet(engine))
-                    } else {
-                        Err("Parakeet engine initialized but no model loaded. This should not happen after validation.".to_string())
-                    }
-                }
-                None => {
-                    Err("Parakeet engine not initialized. This should not happen after validation.".to_string())
-                }
-            }
-        }
-        "localWhisper" | _ => {
-            info!("🎤 Initializing Whisper transcription engine");
-            let whisper_engine = get_or_init_whisper(app).await?;
-            Ok(TranscriptionEngine::Whisper(whisper_engine))
-        }
+    if api_key.is_empty() {
+        return Err("Groq API key not configured".to_string());
     }
-}
 
-/// Get or initialize transcription engine using API configuration
-/// Returns Whisper engine if provider is localWhisper, otherwise returns error for non-Whisper providers
-pub async fn get_or_init_whisper<R: Runtime>(
-    app: &AppHandle<R>,
-) -> Result<Arc<crate::whisper_engine::WhisperEngine>, String> {
-    // Check if engine already exists and has a model loaded
-    let existing_engine = {
-        let engine_guard = crate::whisper_engine::commands::WHISPER_ENGINE
-            .lock()
-            .unwrap();
-        engine_guard.as_ref().cloned()
+    let model = match crate::api::api::api_get_transcript_config(
+        app.clone(), app.clone().state(), None,
+    ).await {
+        Ok(Some(config)) if !config.model.is_empty() => config.model,
+        _ => "whisper-large-v3".to_string(),
     };
 
-    if let Some(engine) = existing_engine {
-        // Check if a model is already loaded
-        if engine.is_model_loaded().await {
-            let current_model = engine
-                .get_current_model()
-                .await
-                .unwrap_or_else(|| "unknown".to_string());
-
-            // NEW: Check if loaded model matches saved config
-            let configured_model = match crate::api::api::api_get_transcript_config(
-                app.clone(),
-                app.clone().state(),
-                None,
-            )
-            .await
-            {
-                Ok(Some(config)) => {
-                    info!(
-                        "📝 Saved transcript config - provider: {}, model: {}",
-                        config.provider, config.model
-                    );
-                    if config.provider == "localWhisper" && !config.model.is_empty() {
-                        Some(config.model)
-                    } else {
-                        None
-                    }
-                }
-                Ok(None) => {
-                    info!("📝 No transcript config found in database");
-                    None
-                }
-                Err(e) => {
-                    warn!("⚠️ Failed to get transcript config: {}", e);
-                    None
-                }
-            };
-
-            // If loaded model matches config, reuse it
-            if let Some(ref expected_model) = configured_model {
-                if current_model == *expected_model {
-                    info!(
-                        "✅ Loaded model '{}' matches saved config, reusing",
-                        current_model
-                    );
-                    return Ok(engine);
-                } else {
-                    info!(
-                        "🔄 Loaded model '{}' doesn't match saved config '{}', reloading correct model...",
-                        current_model, expected_model
-                    );
-                    // Unload the incorrect model
-                    engine.unload_model().await;
-                    info!("📉 Unloaded incorrect model '{}'", current_model);
-                    // Continue to model loading logic below
-                }
-            } else {
-                // No specific config saved, accept currently loaded model
-                info!(
-                    "✅ No specific model configured, using currently loaded model: '{}'",
-                    current_model
-                );
-                return Ok(engine);
-            }
-        } else {
-            info!("🔄 Whisper engine exists but no model loaded, will load model from config");
-        }
-    }
-
-    // Initialize new engine if needed
-    info!("Initializing Whisper engine");
-
-    // First ensure the engine is initialized
-    if let Err(e) = crate::whisper_engine::commands::whisper_init().await {
-        return Err(format!("Failed to initialize Whisper engine: {}", e));
-    }
-
-    // Get the engine reference
-    let engine = {
-        let engine_guard = crate::whisper_engine::commands::WHISPER_ENGINE
-            .lock()
-            .unwrap();
-        engine_guard
-            .as_ref()
-            .cloned()
-            .ok_or("Failed to get initialized engine")?
-    };
-
-    // Get model configuration from API
-    let model_to_load =
-        match crate::api::api::api_get_transcript_config(app.clone(), app.clone().state(), None)
-            .await
-        {
-            Ok(Some(config)) => {
-                info!(
-                    "Got transcript config from API - provider: {}, model: {}",
-                    config.provider, config.model
-                );
-                if config.provider == "localWhisper" {
-                    info!("Using model from API config: {}", config.model);
-                    config.model
-                } else {
-                    // Non-Whisper provider (e.g., parakeet) - this function shouldn't be called
-                    return Err(format!(
-                        "Cannot initialize Whisper engine: Config uses '{}' provider. This is a bug in the transcription task initialization.",
-                        config.provider
-                    ));
-                }
-            }
-            Ok(None) => {
-                info!("No transcript config found in API, falling back to 'small'");
-                "small".to_string()
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to get transcript config from API: {}, falling back to 'small'",
-                    e
-                );
-                "small".to_string()
-            }
-        };
-
-    info!("Selected model to load: {}", model_to_load);
-
-    // Discover available models to check if the desired model is downloaded
-    let models = engine
-        .discover_models()
-        .await
-        .map_err(|e| format!("Failed to discover models: {}", e))?;
-
-    info!("Discovered {} models", models.len());
-    for model in &models {
-        info!(
-            "Model: {} - Status: {:?} - Path: {}",
-            model.name,
-            model.status,
-            model.path.display()
-        );
-    }
-
-    // Check if the desired model is available
-    let model_info = models.iter().find(|model| model.name == model_to_load);
-
-    if model_info.is_none() {
-        info!(
-            "Model '{}' not found in discovered models. Available models: {:?}",
-            model_to_load,
-            models.iter().map(|m| &m.name).collect::<Vec<_>>()
-        );
-    }
-
-    match model_info {
-        Some(model) => {
-            match model.status {
-                crate::whisper_engine::ModelStatus::Available => {
-                    info!("Loading model: {}", model_to_load);
-                    engine
-                        .load_model(&model_to_load)
-                        .await
-                        .map_err(|e| format!("Failed to load model '{}': {}", model_to_load, e))?;
-                    info!("✅ Model '{}' loaded successfully", model_to_load);
-                }
-                crate::whisper_engine::ModelStatus::Missing => {
-                    return Err(format!(
-                        "Model '{}' is not downloaded. Please download it first from the settings.",
-                        model_to_load
-                    ));
-                }
-                crate::whisper_engine::ModelStatus::Downloading { progress } => {
-                    return Err(format!("Model '{}' is currently downloading ({}%). Please wait for it to complete.", model_to_load, progress));
-                }
-                crate::whisper_engine::ModelStatus::Error(ref err) => {
-                    return Err(format!("Model '{}' has an error: {}. Please check the model or try downloading it again.", model_to_load, err));
-                }
-                crate::whisper_engine::ModelStatus::Corrupted { .. } => {
-                    return Err(format!("Model '{}' is corrupted. Please delete it and download again from the settings.", model_to_load));
-                }
-            }
-        }
-        None => {
-            // Check if we have any available models and try to load the first one
-            let available_models: Vec<_> = models
-                .iter()
-                .filter(|m| matches!(m.status, crate::whisper_engine::ModelStatus::Available))
-                .collect();
-
-            if let Some(fallback_model) = available_models.first() {
-                warn!(
-                    "Model '{}' not found, falling back to available model: '{}'",
-                    model_to_load, fallback_model.name
-                );
-                engine.load_model(&fallback_model.name).await.map_err(|e| {
-                    format!(
-                        "Failed to load fallback model '{}': {}",
-                        fallback_model.name, e
-                    )
-                })?;
-                info!(
-                    "✅ Fallback model '{}' loaded successfully",
-                    fallback_model.name
-                );
-            } else {
-                return Err(format!("Model '{}' is not supported and no other models are available. Please download a model from the settings.", model_to_load));
-            }
-        }
-    }
-
-    Ok(engine)
+    info!("Using Groq transcription: model={}", model);
+    Ok(TranscriptionEngine::GroqApi { api_key, model })
 }
